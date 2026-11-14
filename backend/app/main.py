@@ -3,6 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordRequestForm
 from pydantic import BaseModel, EmailStr, Field
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.config import settings
@@ -23,13 +24,19 @@ from app.strategy import frame_from_candles, signal, size_for_risk, simple_backt
 
 
 Base.metadata.create_all(bind=engine)
+
 app = FastAPI(
     title=settings.app_name,
     version="2.2.0",
     description="Market analysis and account workspace. Order execution is disabled.",
 )
 
-origins = [origin.strip() for origin in settings.cors_origins.split(",") if origin.strip()]
+origins = [
+    origin.strip()
+    for origin in settings.cors_origins.split(",")
+    if origin.strip()
+]
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
@@ -86,33 +93,66 @@ class JournalEntry(BaseModel):
 
 @app.on_event("startup")
 def startup_checks_and_seed():
+
     if not settings.jwt_secret or len(settings.jwt_secret) < 32:
         raise RuntimeError(
-            "JWT_SECRET is missing/too short. Run setup.ps1 or configure backend/.env first."
+            "JWT_SECRET is missing/too short. "
+            "Configure JWT_SECRET in Vercel environment variables."
         )
+
     if not settings.fernet_key:
         raise RuntimeError(
-            "FERNET_KEY is missing. Run setup.ps1 or configure backend/.env first."
+            "FERNET_KEY is missing. "
+            "Configure FERNET_KEY in Vercel environment variables."
         )
+
     if settings.delta_env not in {"demo", "live"}:
-        raise RuntimeError("DELTA_ENV must be either 'demo' or 'live'")
+        raise RuntimeError(
+            "DELTA_ENV must be either 'demo' or 'live'"
+        )
 
     if not settings.admin_email or not settings.admin_password:
-        raise RuntimeError("Set ADMIN_EMAIL and ADMIN_PASSWORD in backend/.env")
+        raise RuntimeError(
+            "Set ADMIN_EMAIL and ADMIN_PASSWORD in environment variables."
+        )
 
     db = SessionLocal()
+
     try:
-        existing = db.scalar(select(User).where(User.email == settings.admin_email.lower()))
+        admin_email = settings.admin_email.lower().strip()
+
+        existing = db.scalar(
+            select(User).where(User.email == admin_email)
+        )
+
         if not existing:
+
             owner = User(
-                email=settings.admin_email.lower(),
+                email=admin_email,
                 full_name="Platform Owner",
                 password_hash=hash_password(settings.admin_password),
                 role="admin",
                 status="approved",
             )
+
             db.add(owner)
-            db.commit()
+
+            try:
+                db.commit()
+
+            except IntegrityError:
+                # Multiple Vercel instances may start simultaneously.
+                # Another instance may have created the admin first.
+
+                db.rollback()
+
+                existing = db.scalar(
+                    select(User).where(User.email == admin_email)
+                )
+
+                if existing is None:
+                    raise
+
     finally:
         db.close()
 
@@ -123,6 +163,7 @@ def startup_checks_and_seed():
 
 @app.get("/health")
 def health():
+
     return {
         "ok": True,
         "market_data_environment": settings.delta_env,
@@ -134,11 +175,15 @@ def health():
 
 @app.get("/market/status")
 def market_status(user: User = Depends(approved)):
+
     return {
         "environment": settings.delta_env,
         "market_data_environment": settings.delta_env,
         "order_execution": "disabled",
-        "note": "Market data environment is independent of each user's private API credentials.",
+        "note": (
+            "Market data environment is independent of "
+            "each user's private API credentials."
+        ),
     }
 
 
@@ -147,10 +192,18 @@ def market_status(user: User = Depends(approved)):
 # --------------------------------------------------
 
 @app.post("/auth/register", status_code=201)
-def register(body: Register, db: Session = Depends(get_db)):
+def register(
+    body: Register,
+    db: Session = Depends(get_db),
+):
+
     email = body.email.lower()
+
     if db.scalar(select(User).where(User.email == email)):
-        raise HTTPException(status_code=409, detail="Email already registered")
+        raise HTTPException(
+            status_code=409,
+            detail="Email already registered",
+        )
 
     user = User(
         email=email,
@@ -159,19 +212,48 @@ def register(body: Register, db: Session = Depends(get_db)):
         role="user",
         status="pending",
     )
+
     db.add(user)
     db.commit()
     db.refresh(user)
-    db.add(AuditLog(target_id=user.id, action="register", details="Pending admin approval"))
+
+    db.add(
+        AuditLog(
+            target_id=user.id,
+            action="register",
+            details="Pending admin approval",
+        )
+    )
+
     db.commit()
-    return {"status": "pending", "message": "Registration received; admin approval required"}
+
+    return {
+        "status": "pending",
+        "message": "Registration received; admin approval required",
+    }
 
 
 @app.post("/auth/login")
-def login(form: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
-    user = db.scalar(select(User).where(User.email == form.username.lower()))
-    if not user or not verify_password(form.password, user.password_hash):
-        raise HTTPException(status_code=401, detail="Invalid email or password")
+def login(
+    form: OAuth2PasswordRequestForm = Depends(),
+    db: Session = Depends(get_db),
+):
+
+    user = db.scalar(
+        select(User).where(
+            User.email == form.username.lower()
+        )
+    )
+
+    if not user or not verify_password(
+        form.password,
+        user.password_hash,
+    ):
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid email or password",
+        )
+
     return {
         "access_token": token_for(user),
         "token_type": "bearer",
@@ -182,6 +264,7 @@ def login(form: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get
 
 @app.get("/me")
 def me(user: User = Depends(current_user)):
+
     return {
         "id": user.id,
         "email": user.email,
@@ -196,8 +279,15 @@ def me(user: User = Depends(current_user)):
 # --------------------------------------------------
 
 @app.get("/admin/users")
-def list_users(db: Session = Depends(get_db), _: User = Depends(admin)):
-    users = db.scalars(select(User).order_by(User.created_at.desc())).all()
+def list_users(
+    db: Session = Depends(get_db),
+    _: User = Depends(admin),
+):
+
+    users = db.scalars(
+        select(User).order_by(User.created_at.desc())
+    ).all()
+
     return [
         {
             "id": user.id,
@@ -205,7 +295,10 @@ def list_users(db: Session = Depends(get_db), _: User = Depends(admin)):
             "full_name": user.full_name,
             "role": user.role,
             "status": user.status,
-            "created_at": user.created_at.isoformat() if user.created_at else None,
+            "created_at": (
+                user.created_at.isoformat()
+                if user.created_at else None
+            ),
         }
         for user in users
     ]
@@ -218,14 +311,28 @@ def update_user_status(
     db: Session = Depends(get_db),
     actor: User = Depends(admin),
 ):
-    if body.status not in {"approved", "rejected", "suspended", "pending"}:
-        raise HTTPException(status_code=400, detail="Invalid account status")
+
+    if body.status not in {
+        "approved",
+        "rejected",
+        "suspended",
+        "pending",
+    }:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid account status",
+        )
 
     user = db.get(User, user_id)
+
     if not user or user.role == "admin":
-        raise HTTPException(status_code=404, detail="User not found")
+        raise HTTPException(
+            status_code=404,
+            detail="User not found",
+        )
 
     user.status = body.status
+
     db.add(
         AuditLog(
             actor_id=actor.id,
@@ -233,15 +340,27 @@ def update_user_status(
             action=f"status_{body.status}",
         )
     )
+
     db.commit()
-    return {"id": user.id, "status": user.status}
+
+    return {
+        "id": user.id,
+        "status": user.status,
+    }
 
 
 @app.get("/admin/audit")
-def audit_logs(db: Session = Depends(get_db), _: User = Depends(admin)):
+def audit_logs(
+    db: Session = Depends(get_db),
+    _: User = Depends(admin),
+):
+
     logs = db.scalars(
-        select(AuditLog).order_by(AuditLog.created_at.desc()).limit(500)
+        select(AuditLog)
+        .order_by(AuditLog.created_at.desc())
+        .limit(500)
     ).all()
+
     return [
         {
             "id": item.id,
@@ -249,7 +368,10 @@ def audit_logs(db: Session = Depends(get_db), _: User = Depends(admin)):
             "target_id": item.target_id,
             "action": item.action,
             "details": item.details,
-            "created_at": item.created_at.isoformat() if item.created_at else None,
+            "created_at": (
+                item.created_at.isoformat()
+                if item.created_at else None
+            ),
         }
         for item in logs
     ]
@@ -265,36 +387,62 @@ def save_credentials(
     db: Session = Depends(get_db),
     user: User = Depends(approved),
 ):
+
     if body.environment not in {"demo", "live"}:
-        raise HTTPException(status_code=400, detail="Environment must be demo or live")
+        raise HTTPException(
+            status_code=400,
+            detail="Environment must be demo or live",
+        )
 
     # Private credentials are saved for private account reads only.
     # This does NOT enable order execution.
+
     record = db.scalar(
-        select(DeltaCredential).where(DeltaCredential.user_id == user.id)
+        select(DeltaCredential).where(
+            DeltaCredential.user_id == user.id
+        )
     )
+
     if record is None:
+
         record = DeltaCredential(
             user_id=user.id,
             api_key_enc="",
             api_secret_enc="",
             environment=body.environment,
         )
+
         db.add(record)
 
     record.api_key_enc = encrypt(body.api_key)
     record.api_secret_enc = encrypt(body.api_secret)
     record.environment = body.environment
+
     db.commit()
-    return {"connected": True, "credential_environment": record.environment}
+
+    return {
+        "connected": True,
+        "credential_environment": record.environment,
+    }
 
 
-def user_client(db: Session, user: User) -> DeltaClient:
+def user_client(
+    db: Session,
+    user: User,
+) -> DeltaClient:
+
     record = db.scalar(
-        select(DeltaCredential).where(DeltaCredential.user_id == user.id)
+        select(DeltaCredential).where(
+            DeltaCredential.user_id == user.id
+        )
     )
+
     if not record:
-        raise HTTPException(status_code=400, detail="Connect your Delta API credentials first")
+        raise HTTPException(
+            status_code=400,
+            detail="Connect your Delta API credentials first",
+        )
+
     return DeltaClient(
         decrypt(record.api_key_enc),
         decrypt(record.api_secret_enc),
@@ -303,14 +451,23 @@ def user_client(db: Session, user: User) -> DeltaClient:
 
 
 @app.get("/delta/status")
-def delta_status(db: Session = Depends(get_db), user: User = Depends(approved)):
+def delta_status(
+    db: Session = Depends(get_db),
+    user: User = Depends(approved),
+):
+
     record = db.scalar(
-        select(DeltaCredential).where(DeltaCredential.user_id == user.id)
+        select(DeltaCredential).where(
+            DeltaCredential.user_id == user.id
+        )
     )
+
     return {
         "connected": bool(record),
         "market_data_environment": settings.delta_env,
-        "credential_environment": record.environment if record else None,
+        "credential_environment": (
+            record.environment if record else None
+        ),
         "order_execution": "disabled",
     }
 
@@ -320,58 +477,114 @@ def delta_status(db: Session = Depends(get_db), user: User = Depends(approved)):
 # --------------------------------------------------
 
 @app.get("/market/products")
-def market_products(_: User = Depends(approved)):
+def market_products(
+    _: User = Depends(approved),
+):
+
     try:
-        return DeltaClient(env=settings.delta_env).products()
+        return DeltaClient(
+            env=settings.delta_env
+        ).products()
+
     except (DeltaAPIError, ValueError) as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+        raise HTTPException(
+            status_code=502,
+            detail=str(exc),
+        ) from exc
 
 
 @app.get("/market/tickers")
-def market_tickers(_: User = Depends(approved)):
+def market_tickers(
+    _: User = Depends(approved),
+):
+
     try:
-        return DeltaClient(env=settings.delta_env).tickers()
+        return DeltaClient(
+            env=settings.delta_env
+        ).tickers()
+
     except (DeltaAPIError, ValueError) as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+        raise HTTPException(
+            status_code=502,
+            detail=str(exc),
+        ) from exc
 
 
 def fetch_analysis_data(body: Analyze):
+
     try:
-        raw = DeltaClient(env=settings.delta_env).candles(
+        raw = DeltaClient(
+            env=settings.delta_env
+        ).candles(
             body.symbol,
             body.resolution,
             body.limit,
         )
+
         frame = frame_from_candles(raw)
+
         return raw, frame
+
     except (DeltaAPIError, ValueError) as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+        raise HTTPException(
+            status_code=502,
+            detail=str(exc),
+        ) from exc
 
 
 @app.post("/analysis/signal")
-def analyze(body: Analyze, _: User = Depends(approved)):
+def analyze(
+    body: Analyze,
+    _: User = Depends(approved),
+):
+
     _, frame = fetch_analysis_data(body)
+
     try:
-        result = signal(frame, body.symbol.strip().upper(), body.resolution)
+        result = signal(
+            frame,
+            body.symbol.strip().upper(),
+            body.resolution,
+        )
+
         return result
+
     except ValueError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
+        raise HTTPException(
+            status_code=422,
+            detail=str(exc),
+        ) from exc
 
 
 @app.post("/analysis/candles")
-def analysis_candles(body: Analyze, _: User = Depends(approved)):
+def analysis_candles(
+    body: Analyze,
+    _: User = Depends(approved),
+):
+
     _, frame = fetch_analysis_data(body)
+
     records = frame.to_dict(orient="records")
+
     candles = []
+
     for item in records:
-        candles.append({
-            "time": int(item["time"]) if "time" in item and item["time"] is not None else None,
-            "open": float(item["open"]),
-            "high": float(item["high"]),
-            "low": float(item["low"]),
-            "close": float(item["close"]),
-            "volume": float(item.get("volume", 0)),
-        })
+
+        candles.append(
+            {
+                "time": (
+                    int(item["time"])
+                    if "time" in item and item["time"] is not None
+                    else None
+                ),
+                "open": float(item["open"]),
+                "high": float(item["high"]),
+                "low": float(item["low"]),
+                "close": float(item["close"]),
+                "volume": float(item.get("volume", 0)),
+            }
+        )
+
     return {
         "symbol": body.symbol.strip().upper(),
         "resolution": body.resolution,
@@ -380,12 +593,21 @@ def analysis_candles(body: Analyze, _: User = Depends(approved)):
 
 
 @app.post("/analysis/backtest")
-def backtest(body: Analyze, _: User = Depends(approved)):
+def backtest(
+    body: Analyze,
+    _: User = Depends(approved),
+):
+
     _, frame = fetch_analysis_data(body)
+
     try:
         return simple_backtest(frame)
+
     except ValueError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
+        raise HTTPException(
+            status_code=422,
+            detail=str(exc),
+        ) from exc
 
 
 # --------------------------------------------------
@@ -393,7 +615,11 @@ def backtest(body: Analyze, _: User = Depends(approved)):
 # --------------------------------------------------
 
 @app.post("/risk/position-size")
-def position_size(body: RiskRequest, _: User = Depends(approved)):
+def position_size(
+    body: RiskRequest,
+    _: User = Depends(approved),
+):
+
     try:
         quantity = size_for_risk(
             body.equity,
@@ -402,30 +628,56 @@ def position_size(body: RiskRequest, _: User = Depends(approved)):
             body.risk_pct,
             body.contract_multiplier,
         )
+
     except ValueError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
+        raise HTTPException(
+            status_code=422,
+            detail=str(exc),
+        ) from exc
 
     return {
         "estimated_contract_quantity": quantity,
-        "risk_cash": round(body.equity * body.risk_pct / 100, 2),
-        "note": "Confirm the exchange contract multiplier, minimum quantity, tick size, fees, slippage and margin before using this estimate.",
+        "risk_cash": round(
+            body.equity * body.risk_pct / 100,
+            2,
+        ),
+        "note": (
+            "Confirm the exchange contract multiplier, minimum quantity, "
+            "tick size, fees, slippage and margin before using this estimate."
+        ),
     }
 
 
 @app.get("/account/wallet")
-def wallet(db: Session = Depends(get_db), user: User = Depends(approved)):
+def wallet(
+    db: Session = Depends(get_db),
+    user: User = Depends(approved),
+):
+
     try:
         return user_client(db, user).wallet()
+
     except (DeltaAPIError, ValueError, RuntimeError) as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+        raise HTTPException(
+            status_code=502,
+            detail=str(exc),
+        ) from exc
 
 
 @app.get("/account/positions")
-def positions(db: Session = Depends(get_db), user: User = Depends(approved)):
+def positions(
+    db: Session = Depends(get_db),
+    user: User = Depends(approved),
+):
+
     try:
         return user_client(db, user).positions()
+
     except (DeltaAPIError, ValueError, RuntimeError) as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+        raise HTTPException(
+            status_code=502,
+            detail=str(exc),
+        ) from exc
 
 
 @app.post("/journal")
@@ -434,9 +686,14 @@ def create_journal_entry(
     db: Session = Depends(get_db),
     user: User = Depends(approved),
 ):
+
     side = body.side.upper()
+
     if side not in {"LONG", "SHORT"}:
-        raise HTTPException(status_code=400, detail="Side must be LONG or SHORT")
+        raise HTTPException(
+            status_code=400,
+            detail="Side must be LONG or SHORT",
+        )
 
     record = TradeRecord(
         user_id=user.id,
@@ -445,20 +702,30 @@ def create_journal_entry(
         entry_price=body.entry_price,
         quantity=body.quantity,
     )
+
     db.add(record)
     db.commit()
     db.refresh(record)
-    return {"id": record.id, "status": record.status}
+
+    return {
+        "id": record.id,
+        "status": record.status,
+    }
 
 
 @app.get("/journal")
-def list_journal(db: Session = Depends(get_db), user: User = Depends(approved)):
+def list_journal(
+    db: Session = Depends(get_db),
+    user: User = Depends(approved),
+):
+
     records = db.scalars(
         select(TradeRecord)
         .where(TradeRecord.user_id == user.id)
         .order_by(TradeRecord.created_at.desc())
         .limit(200)
     ).all()
+
     return [
         {
             "id": record.id,
@@ -469,16 +736,28 @@ def list_journal(db: Session = Depends(get_db), user: User = Depends(approved)):
             "quantity": record.quantity,
             "pnl": record.pnl,
             "status": record.status,
-            "created_at": record.created_at.isoformat() if record.created_at else None,
+            "created_at": (
+                record.created_at.isoformat()
+                if record.created_at else None
+            ),
         }
         for record in records
     ]
 
 
-# Deliberately disabled: there is no order-placement implementation in this build.
+# --------------------------------------------------
+# ORDER EXECUTION DISABLED
+# --------------------------------------------------
+
 @app.post("/trading/demo-order")
-def disabled_demo_order(_: User = Depends(approved)):
+def disabled_demo_order(
+    _: User = Depends(approved),
+):
+
     raise HTTPException(
         status_code=403,
-        detail="Order execution is disabled in this build. Use analysis and paper review only.",
+        detail=(
+            "Order execution is disabled in this build. "
+            "Use analysis and paper review only."
+        ),
     )
