@@ -1,0 +1,16 @@
+.env
+backend/.env
+backend/.venv/
+backend/venv/
+backend/__pycache__/
+backend/app/__pycache__/
+backend/data/
+*.db
+*.sqlite3
+frontend/node_modules/
+frontend/dist/
+frontend/*.tsbuildinfo
+desktop/node_modules/
+desktop/renderer/
+desktop/dist/
+.DS_Store

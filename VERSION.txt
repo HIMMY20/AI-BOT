@@ -1,0 +1,3 @@
+Delta AI Trading Platform
+Version: 2.2.0
+Build type: Analysis-only (order execution disabled)
